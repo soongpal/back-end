@@ -1,5 +1,6 @@
 package com.soongsil.soongpal.chat.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.soongsil.soongpal.board.domain.Board;
 import com.soongsil.soongpal.board.domain.BoardCategory;
 import com.soongsil.soongpal.board.repository.BoardRepository;
@@ -10,6 +11,8 @@ import com.soongsil.soongpal.chat.domain.ChatRoomUser;
 import com.soongsil.soongpal.chat.dto.ChatRoomCreateReqDto;
 import com.soongsil.soongpal.chat.dto.ChatRoomResDto;
 import com.soongsil.soongpal.chat.dto.ChatRoomUserResDto;
+import com.soongsil.soongpal.chat.dto.LastMessageDto;
+import com.soongsil.soongpal.chat.dto.LastMessageProjection;
 import com.soongsil.soongpal.chat.repository.ChatMessageRepository;
 import com.soongsil.soongpal.chat.repository.ChatRoomRepository;
 import com.soongsil.soongpal.chat.repository.ChatRoomUserRepository;
@@ -20,19 +23,23 @@ import com.soongsil.soongpal.common.exception.ChatException;
 import com.soongsil.soongpal.user.domain.User;
 import com.soongsil.soongpal.user.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static com.soongsil.soongpal.chat.domain.ChatRoomType.GROUP;
 import static com.soongsil.soongpal.chat.domain.ChatRoomType.PRIVATE;
 
-
-@Service
+@Slf4j
 @Transactional
+@Service
 @RequiredArgsConstructor
 public class ChatRoomService {
 
@@ -42,6 +49,8 @@ public class ChatRoomService {
     private final ChatRoomRepository chatRoomRepository;
     private final ChatMessageRepository chatMessageRepository;
     private final ChatRoomUserRepository chatRoomUserRepository;
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
 
     public ChatRoomResDto createPrivateChatRoom(ChatRoomCreateReqDto dto, Long userId) {
         User findUser = userRepository.findById(userId)
@@ -119,8 +128,7 @@ public class ChatRoomService {
                 .map(ChatRoomUserResDto::from)
                 .toList();
 
-        ChatMessage lastMessage = chatMessageRepository.findLastMessageByRoomId(chatRoom.getId())
-                .orElse(null);
+        ChatMessage lastMessage = chatMessageRepository.findLastMessageByRoomId(chatRoom.getId()).orElse(null);
         String lastContent = lastMessage != null ? lastMessage.getContent() : null;
         LocalDateTime lastCreatedAt = lastMessage != null ? lastMessage.getCreatedAt() : chatRoom.getCreatedAt();
 
@@ -132,22 +140,68 @@ public class ChatRoomService {
 
     public List<ChatRoomResDto> getChatRoomsByUser(Long userId) {
         List<ChatRoom> chatRooms = chatRoomRepository.findChatRoomsByUserId(userId);
+
+        List<Long> roomIds = chatRooms.stream().map(ChatRoom::getId).toList();
+        List<String> keys = roomIds.stream()
+                .map(id -> "chat:room:" + id + ":last-message")
+                .toList();
+
+        List<String> cachedValues = redisTemplate.opsForValue().multiGet(keys);
+
+        Map<Long, LastMessageDto> lastMessageMap = new java.util.HashMap<>();
+        List<Long> missedIds = new java.util.ArrayList<>();
+
+        for (int i = 0; i < roomIds.size(); i++) {
+            String json = cachedValues != null ? cachedValues.get(i) : null;
+            if (json != null) {
+                try {
+                    LastMessageDto dto = objectMapper.readValue(json, LastMessageDto.class);
+                    lastMessageMap.put(roomIds.get(i), dto);
+                } catch (Exception ignored) {
+                    missedIds.add(roomIds.get(i));
+                }
+            } else {
+                missedIds.add(roomIds.get(i));
+            }
+        }
+
+        if (!missedIds.isEmpty()) {
+            chatRoomRepository.findLastMessagesByRoomIds(missedIds)
+                    .stream()
+                    .map(this::toLastMessageDto)
+                    .forEach(dto -> {
+                        lastMessageMap.put(dto.roomId(), dto);
+                        try {
+                            redisTemplate.opsForValue().set(
+                                    "chat:room:" + dto.roomId() + ":last-message",
+                                    objectMapper.writeValueAsString(dto)
+                            );
+                        } catch (Exception e) {
+                            log.warn("Redis cache write failed for room {}: {}", dto.roomId(), e.getMessage());
+                        }
+                    });
+        }
+
+        List<Long> boardIds = chatRooms.stream().map(ChatRoom::getBoardId).toList();
+        Map<Long, Board> boardMap = boardRepository.findAllById(boardIds)
+                .stream()
+                .collect(Collectors.toMap(Board::getId, b -> b));
+
         return chatRooms.stream()
-                .map(c -> boardRepository.findById(c.getBoardId())
+                .map(c -> Optional.ofNullable(boardMap.get(c.getBoardId()))
                         .map(findBoard -> {
                             List<ChatRoomUserResDto> users = c.getChatRoomUsers().stream()
                                     .map(ChatRoomUserResDto::from)
                                     .toList();
 
-                            ChatMessage lastMessage = chatMessageRepository.findLastMessageByRoomId(c.getId())
-                                    .orElse(null);
-                            String lastContent = lastMessage != null ? lastMessage.getContent() : null;
-                            LocalDateTime lastCreatedAt = lastMessage != null ? lastMessage.getCreatedAt() : c.getCreatedAt();
+                            LastMessageDto lastMessage = lastMessageMap.get(c.getId());
+                            String lastContent = lastMessage != null ? lastMessage.content() : null;
+                            LocalDateTime lastCreatedAt = lastMessage != null ? lastMessage.createdAt() : c.getCreatedAt();
 
                             if (findBoard.getCategory() == BoardCategory.USED) {
-                                return ChatRoomResDto.of(c, findBoard.getUser().getNickName(),  findBoard.getId(), findBoard.getTitle(), users, lastContent, lastCreatedAt);
+                                return ChatRoomResDto.of(c, findBoard.getUser().getNickName(), findBoard.getId(), findBoard.getTitle(), users, lastContent, lastCreatedAt);
                             }
-                            return ChatRoomResDto.of(c, findBoard.getTitle(),  findBoard.getId(), findBoard.getTitle(), users, lastContent, lastCreatedAt);
+                            return ChatRoomResDto.of(c, findBoard.getTitle(), findBoard.getId(), findBoard.getTitle(), users, lastContent, lastCreatedAt);
                         })
                 )
                 .flatMap(Optional::stream)
@@ -229,4 +283,7 @@ public class ChatRoomService {
         roomUser.updateLastReadMessage(messageId);
     }
 
+    private LastMessageDto toLastMessageDto(LastMessageProjection projection) {
+        return new LastMessageDto(projection.getRoomId(), projection.getContent(), projection.getCreatedAt());
+    }
 }

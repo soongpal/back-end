@@ -15,7 +15,6 @@ import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-
 @Service
 @Transactional
 @RequiredArgsConstructor
@@ -36,8 +35,6 @@ public class ChatMessageService {
                     Integer unreadCount = chatRoomUserRepository.countUnreadUsers(roomId, message.getId());
                     return ChatMessageResDto.from(message, unreadCount);
                 });
-        return  ChatPageResDto.from(messages);
+        return ChatPageResDto.from(messages);
     }
-
-
 }
