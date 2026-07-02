@@ -1,7 +1,6 @@
 package com.soongsil.soongpal.chat.dto;
 
 import com.soongsil.soongpal.chat.domain.ChatRoomUser;
-import com.soongsil.soongpal.user.domain.User;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -23,5 +22,4 @@ public class ChatRoomUserResDto {
                 .userName(roomUser.getUser().getNickName())
                 .build();
     }
-
 }
